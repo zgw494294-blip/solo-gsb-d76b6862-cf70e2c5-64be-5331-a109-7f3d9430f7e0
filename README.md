@@ -20,6 +20,30 @@ uvicorn app.main:app --reload      # http://localhost:8000
 pytest                             # 运行测试
 ```
 
+## 并发与背压
+
+所有音频 POST 接口共用一个有界进程执行器：音频计算在子进程（进程池）中
+执行，HTTP 请求等待并返回原结果；事件循环不被计算阻塞，`GET /health`
+不经过队列，饱和时仍可响应。限额为**单个 Uvicorn 进程**级别，由环境变量
+配置：
+
+| 环境变量 | 默认 | 范围 | 说明 |
+|---|---|---|---|
+| `AUDIO_WORKERS` | `2` | 1～8 | 同时运行的音频计算数（进程池 worker 数） |
+| `AUDIO_QUEUE` | `4` | 0～32 | 等待运行名额的 FIFO 队列长度 |
+
+行为规则：
+
+* 运行名额已满且队列已满时，请求**立即**返回 `503` 并携带
+  `Retry-After: 1`，任务不会继续堆积到进程池；
+* 排队中的请求若客户端断开，会被移出队列并释放排队名额；
+* 运行中的请求若客户端断开，仅丢弃结果——名额仍被占用，直到子进程中的
+  计算结束后才释放，并移交给队首等待者（FIFO，不允许插队）；
+* 完成、业务异常（`422`）与断开竞态下，名额都只释放一次；
+* 执行器随应用启动创建、关闭时回收。请始终使用**单个** Uvicorn 进程
+  （Docker 镜像与 compose 默认如此；不要加 `--workers`），否则限额不再
+  是全局的。
+
 ## API
 
 ### `POST /v1/normalize`
@@ -462,6 +486,9 @@ WSOLA 变速不变调：按时长倍率 `1/speed` 改变 WAV 时长而保持原�
 错误：`422` —— Base64 非法、任一 WAV 不合规、脉冲响应时长不在 1–2 s、
 脉冲响应全静音、`wet` 越界或为非有限值（NaN/±Inf）。
 
+所有音频 POST 接口在饱和时还可能返回 `503`（携带 `Retry-After: 1`），
+见上文「并发与背压」。
+
 ### 处理流程
 
 1. 用 `pyloudnorm`（BS.1770 K 加权）测输入综合响度；
@@ -865,7 +892,8 @@ EOF
 
 ```
 app/
-  main.py          # FastAPI 入口与请求/响应模型
+  main.py          # FastAPI 入口与请求/响应模型；执行器生命周期与 503 映射
+  executor.py      # 共享有界进程执行器：FIFO 准入、断开处理、测试阻塞门
   loudness.py      # WAV 校验、响度/真峰值测量、增益与量化
   compare_gain.py  # 增益/时移核验：归一化互相关、最小二乘增益、残差窗
   cut_splice.py    # 区间删除、保留片段拼接、接缝线性交叉淡化与标注映射
@@ -889,6 +917,7 @@ tests/
   test_eq.py
   test_onsets.py
   test_convolution_reverb.py
+  test_executor.py
 Dockerfile
 docker-compose.yml
 requirements.txt        # 运行依赖（已锁定版本）

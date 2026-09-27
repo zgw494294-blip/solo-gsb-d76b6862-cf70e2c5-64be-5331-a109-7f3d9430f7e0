@@ -3,4 +3,8 @@ services:
     build: .
     ports:
       - "8000:8000"
+    environment:
+      # 单个 Uvicorn 进程内的音频执行器限额（详见 README）
+      AUDIO_WORKERS: "2"   # 同时运行的音频计算进程数，1~8
+      AUDIO_QUEUE: "4"     # FIFO 排队等待数，0~32；满额立即 503
     restart: unless-stopped

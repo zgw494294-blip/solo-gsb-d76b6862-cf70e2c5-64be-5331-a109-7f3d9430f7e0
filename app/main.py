@@ -2,14 +2,17 @@
 true-peak ceiling (EBU R128, static gain only)."""
 from __future__ import annotations
 
+import asyncio
 import base64
 import binascii
+import contextlib
 import math
+from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.encoders import jsonable_encoder
 from fastapi.exceptions import RequestValidationError
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, Response
 from pydantic import BaseModel, Field
 
 from .align_stereo import align_stereo_wav
@@ -19,12 +22,91 @@ from .convolution_reverb import convolution_reverb_wav
 from .cut_splice import CueInterval, cut_splice_wav
 from .denoise import denoise_wav
 from .eq import EqBand, eq_wav
+from .executor import (
+    AudioExecutor,
+    ClientDisconnectedError,
+    QueueFullError,
+    queue_size_from_env,
+    worker_count_from_env,
+)
 from .loudness import SAMPLE_RATE, AudioValidationError, normalize_wav
 from .onsets import detect_onsets
 from .repair_gaps import RepairMethod, repair_gaps_wav
 from .time_stretch import time_stretch_wav
 
-app = FastAPI(title="WAV Loudness Normalizer", version="1.0.0")
+
+def _create_executor() -> AudioExecutor:
+    executor = AudioExecutor(worker_count_from_env(), queue_size_from_env())
+    executor.start()
+    return executor
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # The shared executor is created with the app and reclaimed on shutdown.
+    existing = getattr(app.state, "audio_executor", None)
+    if existing is not None and not existing.closed:
+        await existing.shutdown()
+    app.state.audio_executor = _create_executor()
+    try:
+        yield
+    finally:
+        executor = app.state.audio_executor
+        app.state.audio_executor = None
+        await executor.shutdown()
+
+
+app = FastAPI(title="WAV Loudness Normalizer", version="1.0.0", lifespan=lifespan)
+
+
+def _get_executor(request: Request) -> AudioExecutor:
+    # Normally created by the lifespan; lazily recreated if the app runs
+    # without it (e.g. a bare TestClient) or after it was shut down.
+    executor = getattr(request.app.state, "audio_executor", None)
+    if executor is None or executor.closed:
+        executor = _create_executor()
+        request.app.state.audio_executor = executor
+    return executor
+
+
+async def _watch_disconnect(request: Request, cancel: asyncio.Event) -> None:
+    # The request body is already consumed at this point, so the only
+    # message that can still arrive is the client going away.
+    try:
+        while not cancel.is_set():
+            message = await request.receive()
+            if message.get("type") == "http.disconnect":
+                cancel.set()
+                return
+    except Exception:
+        cancel.set()
+
+
+@app.exception_handler(ClientDisconnectedError)
+async def client_disconnected_handler(
+    request: Request, exc: ClientDisconnectedError
+) -> Response:
+    # The client is gone; the response is a formality and may never send.
+    return Response(status_code=499)
+
+
+async def _run_audio(request: Request, fn, *args):
+    """Run an audio computation on the shared bounded process executor."""
+    executor = _get_executor(request)
+    cancel = asyncio.Event()
+    watcher = asyncio.create_task(_watch_disconnect(request, cancel))
+    try:
+        return await executor.run(fn, *args, cancel_event=cancel)
+    except QueueFullError as exc:
+        raise HTTPException(
+            status_code=503,
+            detail="Audio executor busy: all workers and queue slots are in use",
+            headers={"Retry-After": "1"},
+        ) from exc
+    finally:
+        watcher.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await watcher
 
 
 def _json_safe(value):
@@ -453,7 +535,9 @@ def health() -> dict:
 
 
 @app.post("/v1/normalize", response_model=NormalizeResponse)
-def normalize(request: NormalizeRequest) -> NormalizeResponse:
+async def normalize(
+    request: NormalizeRequest, http_request: Request
+) -> NormalizeResponse:
     try:
         wav_bytes = base64.b64decode(request.wav_base64, validate=True)
     except (binascii.Error, ValueError) as exc:
@@ -462,7 +546,13 @@ def normalize(request: NormalizeRequest) -> NormalizeResponse:
         ) from exc
 
     try:
-        result = normalize_wav(wav_bytes, request.target_lufs, request.ceiling_dbtp)
+        result = await _run_audio(
+            http_request,
+            normalize_wav,
+            wav_bytes,
+            request.target_lufs,
+            request.ceiling_dbtp,
+        )
     except AudioValidationError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
 
@@ -478,7 +568,9 @@ def normalize(request: NormalizeRequest) -> NormalizeResponse:
 
 
 @app.post("/v1/compare-gain", response_model=CompareGainResponse)
-def compare_gain(request: CompareGainRequest) -> CompareGainResponse:
+async def compare_gain(
+    request: CompareGainRequest, http_request: Request
+) -> CompareGainResponse:
     try:
         reference_wav = base64.b64decode(
             request.reference_wav_base64, validate=True
@@ -492,7 +584,9 @@ def compare_gain(request: CompareGainRequest) -> CompareGainResponse:
         ) from exc
 
     try:
-        result = compare_wav_gain(reference_wav, candidate_wav)
+        result = await _run_audio(
+            http_request, compare_wav_gain, reference_wav, candidate_wav
+        )
     except AudioValidationError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
 
@@ -512,7 +606,9 @@ def compare_gain(request: CompareGainRequest) -> CompareGainResponse:
 
 
 @app.post("/v1/cut-splice", response_model=CutSpliceResponse)
-def cut_splice(request: CutSpliceRequest) -> CutSpliceResponse:
+async def cut_splice(
+    request: CutSpliceRequest, http_request: Request
+) -> CutSpliceResponse:
     try:
         wav_bytes = base64.b64decode(request.wav_base64, validate=True)
     except (binascii.Error, ValueError) as exc:
@@ -521,7 +617,9 @@ def cut_splice(request: CutSpliceRequest) -> CutSpliceResponse:
         ) from exc
 
     try:
-        result = cut_splice_wav(
+        result = await _run_audio(
+            http_request,
+            cut_splice_wav,
             wav_bytes,
             request.remove_intervals,
             request.crossfade_ms,
@@ -553,7 +651,9 @@ def cut_splice(request: CutSpliceRequest) -> CutSpliceResponse:
 
 
 @app.post("/v1/repair-gaps", response_model=RepairGapsResponse)
-def repair_gaps(request: RepairGapsRequest) -> RepairGapsResponse:
+async def repair_gaps(
+    request: RepairGapsRequest, http_request: Request
+) -> RepairGapsResponse:
     try:
         wav_bytes = base64.b64decode(request.wav_base64, validate=True)
     except (binascii.Error, ValueError) as exc:
@@ -562,7 +662,9 @@ def repair_gaps(request: RepairGapsRequest) -> RepairGapsResponse:
         ) from exc
 
     try:
-        result = repair_gaps_wav(wav_bytes, request.gaps)
+        result = await _run_audio(
+            http_request, repair_gaps_wav, wav_bytes, request.gaps
+        )
     except AudioValidationError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
 
@@ -576,7 +678,9 @@ def repair_gaps(request: RepairGapsRequest) -> RepairGapsResponse:
 
 
 @app.post("/v1/denoise", response_model=DenoiseResponse)
-def denoise(request: DenoiseRequest) -> DenoiseResponse:
+async def denoise(
+    request: DenoiseRequest, http_request: Request
+) -> DenoiseResponse:
     try:
         wav_bytes = base64.b64decode(request.wav_base64, validate=True)
     except (binascii.Error, ValueError) as exc:
@@ -585,8 +689,12 @@ def denoise(request: DenoiseRequest) -> DenoiseResponse:
         ) from exc
 
     try:
-        result = denoise_wav(
-            wav_bytes, request.noise_interval, request.strength
+        result = await _run_audio(
+            http_request,
+            denoise_wav,
+            wav_bytes,
+            request.noise_interval,
+            request.strength,
         )
     except AudioValidationError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
@@ -597,7 +705,9 @@ def denoise(request: DenoiseRequest) -> DenoiseResponse:
 
 
 @app.post("/v1/compress", response_model=CompressResponse)
-def compress(request: CompressRequest) -> CompressResponse:
+async def compress(
+    request: CompressRequest, http_request: Request
+) -> CompressResponse:
     try:
         wav_bytes = base64.b64decode(request.wav_base64, validate=True)
     except (binascii.Error, ValueError) as exc:
@@ -606,7 +716,9 @@ def compress(request: CompressRequest) -> CompressResponse:
         ) from exc
 
     try:
-        result = compress_wav(
+        result = await _run_audio(
+            http_request,
+            compress_wav,
             wav_bytes,
             request.threshold_dbfs,
             request.ratio,
@@ -623,7 +735,9 @@ def compress(request: CompressRequest) -> CompressResponse:
 
 
 @app.post("/v1/time-stretch", response_model=TimeStretchResponse)
-def time_stretch(request: TimeStretchRequest) -> TimeStretchResponse:
+async def time_stretch(
+    request: TimeStretchRequest, http_request: Request
+) -> TimeStretchResponse:
     try:
         wav_bytes = base64.b64decode(request.wav_base64, validate=True)
     except (binascii.Error, ValueError) as exc:
@@ -632,7 +746,9 @@ def time_stretch(request: TimeStretchRequest) -> TimeStretchResponse:
         ) from exc
 
     try:
-        result = time_stretch_wav(wav_bytes, request.speed)
+        result = await _run_audio(
+            http_request, time_stretch_wav, wav_bytes, request.speed
+        )
     except AudioValidationError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
 
@@ -643,7 +759,9 @@ def time_stretch(request: TimeStretchRequest) -> TimeStretchResponse:
 
 
 @app.post("/v1/align-stereo", response_model=AlignStereoResponse)
-def align_stereo(request: AlignStereoRequest) -> AlignStereoResponse:
+async def align_stereo(
+    request: AlignStereoRequest, http_request: Request
+) -> AlignStereoResponse:
     try:
         wav_bytes = base64.b64decode(request.wav_base64, validate=True)
     except (binascii.Error, ValueError) as exc:
@@ -652,7 +770,9 @@ def align_stereo(request: AlignStereoRequest) -> AlignStereoResponse:
         ) from exc
 
     try:
-        result = align_stereo_wav(wav_bytes, request.calibration_interval)
+        result = await _run_audio(
+            http_request, align_stereo_wav, wav_bytes, request.calibration_interval
+        )
     except AudioValidationError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
 
@@ -665,7 +785,7 @@ def align_stereo(request: AlignStereoRequest) -> AlignStereoResponse:
 
 
 @app.post("/v1/eq", response_model=EqResponse)
-def eq(request: EqRequest) -> EqResponse:
+async def eq(request: EqRequest, http_request: Request) -> EqResponse:
     try:
         wav_bytes = base64.b64decode(request.wav_base64, validate=True)
     except (binascii.Error, ValueError) as exc:
@@ -674,7 +794,9 @@ def eq(request: EqRequest) -> EqResponse:
         ) from exc
 
     try:
-        result = eq_wav(
+        result = await _run_audio(
+            http_request,
+            eq_wav,
             wav_bytes,
             [
                 EqBand(
@@ -698,7 +820,7 @@ def eq(request: EqRequest) -> EqResponse:
 
 
 @app.post("/v1/onsets", response_model=OnsetsResponse)
-def onsets(request: OnsetsRequest) -> OnsetsResponse:
+async def onsets(request: OnsetsRequest, http_request: Request) -> OnsetsResponse:
     try:
         wav_bytes = base64.b64decode(request.wav_base64, validate=True)
     except (binascii.Error, ValueError) as exc:
@@ -707,7 +829,9 @@ def onsets(request: OnsetsRequest) -> OnsetsResponse:
         ) from exc
 
     try:
-        result = detect_onsets(wav_bytes, request.min_relative_flux)
+        result = await _run_audio(
+            http_request, detect_onsets, wav_bytes, request.min_relative_flux
+        )
     except AudioValidationError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
 
@@ -720,8 +844,9 @@ def onsets(request: OnsetsRequest) -> OnsetsResponse:
 
 
 @app.post("/v1/convolution-reverb", response_model=ConvolutionReverbResponse)
-def convolution_reverb(
+async def convolution_reverb(
     request: ConvolutionReverbRequest,
+    http_request: Request,
 ) -> ConvolutionReverbResponse:
     try:
         wav_bytes = base64.b64decode(request.wav_base64, validate=True)
@@ -732,7 +857,13 @@ def convolution_reverb(
         ) from exc
 
     try:
-        result = convolution_reverb_wav(wav_bytes, ir_wav_bytes, request.wet)
+        result = await _run_audio(
+            http_request,
+            convolution_reverb_wav,
+            wav_bytes,
+            ir_wav_bytes,
+            request.wet,
+        )
     except AudioValidationError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
 
