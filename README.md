@@ -20,6 +20,28 @@ uvicorn app.main:app --reload      # http://localhost:8000
 pytest                             # 运行测试
 ```
 
+## 并发与容量
+
+全部音频 POST 接口共享一个**有界进程执行器**：音频计算在子进程池中执行，
+HTTP 处理协程等待并返回原结果。Compose 运行**单个 Uvicorn 进程**，并发度由
+进程内执行器限制：
+
+| 环境变量 | 默认 | 范围 | 说明 |
+|---|---|---|---|
+| `AUDIO_WORKERS` | 2 | 1～8 | 同时运行的音频计算数（子进程池大小） |
+| `AUDIO_QUEUE` | 4 | 0～32 | FIFO 排队等待的请求数上限 |
+
+行为规则：
+
+- 运行数 + 排队数满额时，新请求**立即返回 `503`** 并带 `Retry-After: 1`，
+  不会继续向进程池堆积任务；
+- 排队中的请求断开连接：从队列移除并释放名额；运行中的请求断开：仅丢弃
+  结果，待计算结束后才释放名额；
+- 完成、业务异常（`422`）与取消竞态均只释放一次名额，队列严格 FIFO，
+  后续请求不插队；
+- `GET /health` 不经过队列，饱和时仍可响应；
+- 执行器随应用启动创建、关闭时回收。
+
 ## API
 
 ### `POST /v1/normalize`
@@ -865,7 +887,8 @@ EOF
 
 ```
 app/
-  main.py          # FastAPI 入口与请求/响应模型
+  main.py          # FastAPI 入口与请求/响应模型；执行器生命周期与 503 映射
+  executor.py      # 共享有界进程执行器：FIFO 队列、断开与异常的名额释放
   loudness.py      # WAV 校验、响度/真峰值测量、增益与量化
   compare_gain.py  # 增益/时移核验：归一化互相关、最小二乘增益、残差窗
   cut_splice.py    # 区间删除、保留片段拼接、接缝线性交叉淡化与标注映射
@@ -889,6 +912,8 @@ tests/
   test_eq.py
   test_onsets.py
   test_convolution_reverb.py
+  test_executor.py          # 执行器并发：满队列、两阶段断开、异常后容量恢复
+  test_concurrency_http.py  # HTTP 层并发：503+Retry-After、/health 旁路、生命周期
 Dockerfile
 docker-compose.yml
 requirements.txt        # 运行依赖（已锁定版本）
